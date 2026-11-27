@@ -5,11 +5,11 @@
   },
   "short": "komari-otp-login",
   "description": {
-    "zh_CN": "通过 Komari 已配置的通知渠道发送一次性验证码登录。验证码有效期为 3 分钟。",
-    "en": "Sign in with a one-time code sent through a configured Komari notification channel. Codes expire after three minutes."
+    "zh_CN": "通过 Komari 已配置的通知渠道发送一次性验证码登录。支持自定义验证码有效期、总速率与单 IP 速率限制。",
+    "en": "Sign in with a one-time code sent through a configured Komari notification channel, with configurable code lifetime, global rate limits, and per-IP rate limits."
   },
   "author": "Akizon77",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "entry": "script.js",
   "icon": "assets/key-round.svg",
   "komari": ">=1.6.0",
@@ -20,5 +20,174 @@
     "allowSystemRPC": true,
     "maxHTTPBodyBytes": 16384,
     "timeout": 15
+  },
+  "configuration": {
+    "type": "managed",
+    "data": [
+      {
+        "type": "title",
+        "name": {
+          "zh_CN": "验证码设置",
+          "en": "Code Settings"
+        }
+      },
+      {
+        "key": "code_ttl_seconds",
+        "name": {
+          "zh_CN": "验证码有效期（秒）",
+          "en": "Code Lifetime (seconds)"
+        },
+        "type": "number",
+        "default": 180,
+        "help": {
+          "zh_CN": "单个验证码的有效时长（30–3600 秒），默认 180 秒（3 分钟）。",
+          "en": "How long a generated code remains valid (30–3600s). Default: 180s (3 minutes)."
+        }
+      },
+      {
+        "key": "resend_cooldown_seconds",
+        "name": {
+          "zh_CN": "重发冷却时间（秒）",
+          "en": "Resend Cooldown (seconds)"
+        },
+        "type": "number",
+        "default": 60,
+        "help": {
+          "zh_CN": "成功发送验证码后再次生成新验证码的最短间隔（5–3600 秒），默认 60 秒。生成新验证码会立即作废旧验证码。",
+          "en": "Minimum interval before issuing a new code after a send (5–3600s). Default: 60s. Issuing a new code immediately invalidates any prior active code."
+        }
+      },
+      {
+        "key": "max_code_attempts",
+        "name": {
+          "zh_CN": "单验证码最大失败次数",
+          "en": "Max Failed Attempts per Code"
+        },
+        "type": "number",
+        "default": 5,
+        "help": {
+          "zh_CN": "同一个验证码允许输错的最大次数（1–100），达到后该验证码立即作废，默认 5 次。",
+          "en": "Maximum failed verification attempts before the active code is invalidated (1–100). Default: 5."
+        }
+      },
+      {
+        "type": "title",
+        "name": {
+          "zh_CN": "总速率限制",
+          "en": "Global Rate Limits"
+        }
+      },
+      {
+        "key": "global_send_window_seconds",
+        "name": {
+          "zh_CN": "发送接口总限流窗口（秒）",
+          "en": "Global Send Window (seconds)"
+        },
+        "type": "number",
+        "default": 900,
+        "help": {
+          "zh_CN": "全局统计发送请求速率的滑动窗口时长（10–86400 秒），默认 900 秒（15 分钟）。",
+          "en": "Rolling window for the global send rate limit (10–86400s). Default: 900s (15 minutes)."
+        }
+      },
+      {
+        "key": "global_send_max_requests",
+        "name": {
+          "zh_CN": "发送接口总最大请求数",
+          "en": "Global Max Send Requests"
+        },
+        "type": "number",
+        "default": 10,
+        "help": {
+          "zh_CN": "在发送总限流窗口内允许的所有 IP 累计发送请求上限（1–1000），默认 10 次。",
+          "en": "Maximum total send requests across all IPs within the global send window (1–1000). Default: 10."
+        }
+      },
+      {
+        "key": "global_verify_window_seconds",
+        "name": {
+          "zh_CN": "验证接口总限流窗口（秒）",
+          "en": "Global Verify Window (seconds)"
+        },
+        "type": "number",
+        "default": 900,
+        "help": {
+          "zh_CN": "全局统计验证请求速率的滑动窗口时长（10–86400 秒），默认 900 秒（15 分钟）。",
+          "en": "Rolling window for the global verify rate limit (10–86400s). Default: 900s (15 minutes)."
+        }
+      },
+      {
+        "key": "global_verify_max_requests",
+        "name": {
+          "zh_CN": "验证接口总最大请求数",
+          "en": "Global Max Verify Requests"
+        },
+        "type": "number",
+        "default": 30,
+        "help": {
+          "zh_CN": "在验证总限流窗口内允许的所有 IP 累计验证请求上限（1–5000），默认 30 次。",
+          "en": "Maximum total verify requests across all IPs within the global verify window (1–5000). Default: 30."
+        }
+      },
+      {
+        "type": "title",
+        "name": {
+          "zh_CN": "单 IP 速率限制",
+          "en": "Per-IP Rate Limits"
+        }
+      },
+      {
+        "key": "ip_send_window_seconds",
+        "name": {
+          "zh_CN": "发送接口单 IP 限流窗口（秒）",
+          "en": "Per-IP Send Window (seconds)"
+        },
+        "type": "number",
+        "default": 900,
+        "help": {
+          "zh_CN": "单个 IP 统计发送请求速率的滑动窗口时长（10–86400 秒），默认 900 秒（15 分钟）。",
+          "en": "Rolling window for the per-IP send rate limit (10–86400s). Default: 900s (15 minutes)."
+        }
+      },
+      {
+        "key": "ip_send_max_requests",
+        "name": {
+          "zh_CN": "发送接口单 IP 最大请求数",
+          "en": "Per-IP Max Send Requests"
+        },
+        "type": "number",
+        "default": 5,
+        "help": {
+          "zh_CN": "单个 IP 在发送限流窗口内允许的发送请求上限（1–1000），默认 5 次。",
+          "en": "Maximum send requests per IP within the per-IP send window (1–1000). Default: 5."
+        }
+      },
+      {
+        "key": "ip_verify_window_seconds",
+        "name": {
+          "zh_CN": "验证接口单 IP 限流窗口（秒）",
+          "en": "Per-IP Verify Window (seconds)"
+        },
+        "type": "number",
+        "default": 900,
+        "help": {
+          "zh_CN": "单个 IP 统计验证请求速率的滑动窗口时长（10–86400 秒），默认 900 秒（15 分钟）。",
+          "en": "Rolling window for the per-IP verify rate limit (10–86400s). Default: 900s (15 minutes)."
+        }
+      },
+      {
+        "key": "ip_verify_max_requests",
+        "name": {
+          "zh_CN": "验证接口单 IP 最大请求数",
+          "en": "Per-IP Max Verify Requests"
+        },
+        "type": "number",
+        "default": 10,
+        "help": {
+          "zh_CN": "单个 IP 在验证限流窗口内允许的验证请求上限（1–5000），默认 10 次。",
+          "en": "Maximum verify requests per IP within the per-IP verify window (1–5000). Default: 10."
+        }
+      }
+    ]
   }
 }

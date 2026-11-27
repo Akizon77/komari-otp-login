@@ -1,5 +1,5 @@
 param(
-  [string]$OutputPath = (Join-Path $PSScriptRoot "komari-otp-login-1.0.0.zip")
+  [string]$OutputPath = (Join-Path $PSScriptRoot "komari-otp-login-1.1.0.zip")
 )
 
 # Explicit relative entries so the ZIP always uses forward slashes

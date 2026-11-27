@@ -10,6 +10,7 @@
       usernamePlaceholder: "Username",
       next: "Next",
       codeCopy: "A code will be sent to you. It expires in 3 minutes.",
+      codeCopyWithDuration: "A code has been sent to you. It expires in {duration}.",
       trouble: "Having trouble?",
       resend: "Resend code",
       resendIn: "Resend in {seconds}s",
@@ -20,8 +21,13 @@
       expired: "The code has expired. Send a new one.",
       attempts: "Too many attempts. Send a new code.",
       resendSoon: "Please wait before sending another code.",
+      resendSoonWithWait: "Please wait {wait} before sending another code.",
+      sendInProgress: "A verification code is already being sent. Please wait.",
       invalidUsername: "The username is incorrect.",
-      ipRateLimited: "Too many attempts from this IP address. Try again in 15 minutes.",
+      ipRateLimited: "Too many requests from this IP address. Please try again later.",
+      ipRateLimitedWithWait: "Too many requests from this IP address. Try again in {wait}.",
+      globalRateLimited: "Too many requests right now. Please try again later.",
+      globalRateLimitedWithWait: "Too many requests right now. Try again in {wait}.",
       failed: "The sign-in request could not be completed.",
       codeDigit: "Code character {index}",
     },
@@ -31,7 +37,8 @@
       usernameCopy: "请输入您的用户名",
       usernamePlaceholder: "用户名",
       next: "下一步",
-      codeCopy: "验证码将发送给您，有效期为3分钟。",
+      codeCopy: "验证码将发送给您，有效期为 3 分钟。",
+      codeCopyWithDuration: "验证码已发送给您，有效期为 {duration}。",
       trouble: "遇到问题？",
       resend: "重发验证码",
       resendIn: "{seconds} 秒后重发",
@@ -42,8 +49,13 @@
       expired: "验证码已过期，请重新发送。",
       attempts: "尝试次数过多，请重新发送验证码。",
       resendSoon: "请稍后再发送验证码。",
+      resendSoonWithWait: "请等待 {wait} 后再发送验证码。",
+      sendInProgress: "正在发送验证码，请稍候。",
       invalidUsername: "用户名不正确。",
-      ipRateLimited: "此 IP 尝试次数过多，请在 15 分钟后重试。",
+      ipRateLimited: "此 IP 请求过于频繁，请稍后再试。",
+      ipRateLimitedWithWait: "此 IP 请求过于频繁，请在 {wait} 后重试。",
+      globalRateLimited: "当前请求过于频繁，请稍后再试。",
+      globalRateLimitedWithWait: "当前请求过于频繁，请在 {wait} 后重试。",
       failed: "无法完成登录请求。",
       codeDigit: "验证码第 {index} 位",
     },
@@ -74,6 +86,9 @@
         if (!response.ok || data.ok !== true) {
           var error = new Error(data.code || "internal_error");
           error.code = data.code;
+          if (typeof data.retry_after === "number" && data.retry_after > 0) {
+            error.retryAfter = Math.ceil(data.retry_after);
+          }
           throw error;
         }
         return data;
@@ -105,16 +120,55 @@
     return node;
   }
 
+  function formatDuration(seconds) {
+    var total = Math.max(1, Math.ceil(Number(seconds) || 0));
+    var isZh = locale() === "zh-CN";
+    if (total >= 60 && total % 60 === 0) {
+      var minutes = total / 60;
+      if (isZh) {
+        return minutes + " 分钟";
+      }
+      return minutes === 1 ? "1 minute" : minutes + " minutes";
+    }
+    if (total >= 60) {
+      var wholeMinutes = Math.floor(total / 60);
+      var remSeconds = total % 60;
+      if (isZh) {
+        return wholeMinutes + " 分 " + remSeconds + " 秒";
+      }
+      return wholeMinutes + "m " + remSeconds + "s";
+    }
+    if (isZh) {
+      return total + " 秒";
+    }
+    return total === 1 ? "1 second" : total + " seconds";
+  }
+
   function errorMessage(error) {
     var code = error && error.code ? error.code : "";
+    var retryAfter = error && typeof error.retryAfter === "number" && error.retryAfter > 0
+      ? error.retryAfter
+      : 0;
+    if (retryAfter > 0) {
+      var waitKey = {
+        resend_too_soon: "resendSoonWithWait",
+        ip_rate_limited: "ipRateLimitedWithWait",
+        global_rate_limited: "globalRateLimitedWithWait",
+      }[code];
+      if (waitKey) {
+        return t(waitKey, { wait: formatDuration(retryAfter) });
+      }
+    }
     var key = {
       notification_failed: "notificationFailed",
       invalid_code: "invalidCode",
       code_expired: "expired",
       too_many_attempts: "attempts",
       resend_too_soon: "resendSoon",
+      send_in_progress: "sendInProgress",
       invalid_username: "invalidUsername",
       ip_rate_limited: "ipRateLimited",
+      global_rate_limited: "globalRateLimited",
     }[code];
     return key ? t(key) : t("failed");
   }
@@ -174,7 +228,8 @@
 
     var codeStep = element("div", "km-otp-login-step km-otp-login-code-step");
     codeStep.hidden = true;
-    codeStep.appendChild(element("p", "rt-Text rt-r-size-3 km-otp-login-copy", t("codeCopy")));
+    var codeCopy = element("p", "rt-Text rt-r-size-3 km-otp-login-copy", t("codeCopy"));
+    codeStep.appendChild(codeCopy);
     var codeInputsRoot = element("div", "km-otp-login-code-inputs");
     var codeInputs = [];
     for (var index = 0; index < 8; index += 1) {
@@ -305,6 +360,9 @@
       setError(null);
       api("/send", { username: username.value.trim() })
         .then(function (data) {
+          if (typeof data.expires_in === "number" && data.expires_in > 0) {
+            codeCopy.textContent = t("codeCopyWithDuration", { duration: formatDuration(data.expires_in) });
+          }
           startCooldown(data.resend_in);
           resetCodeInputs();
           onSuccess();
@@ -353,6 +411,10 @@
       resend.textContent = t("sending");
       sendCode(function (error) {
         if (error) {
+          if (error.code === "resend_too_soon" && error.retryAfter > 0) {
+            startCooldown(error.retryAfter);
+            return;
+          }
           resend.disabled = false;
           resend.textContent = t("resend");
           return;

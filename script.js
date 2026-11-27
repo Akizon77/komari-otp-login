@@ -3,16 +3,255 @@ const crypto = require("crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const CODE_TTL_MS = 3 * 60 * 1000;
-const RESEND_COOLDOWN_MS = 60 * 1000;
-const MAX_CODE_ATTEMPTS = 5;
-const IP_ATTEMPT_WINDOW_MS = 15 * 60 * 1000;
-const MAX_IP_ATTEMPTS = 10;
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SEND_LOCK_TTL_MS = 15 * 1000;
+const MAX_TRACKED_IPS = 4096;
+const MAX_USER_AGENT_LENGTH = 200;
 
-const loginCodesByIP = new Map();
-const failedAttemptsByIP = new Map();
+const DEFAULT_CONFIG = {
+  codeTtlSeconds: 180,
+  resendCooldownSeconds: 60,
+  maxCodeAttempts: 5,
+  globalSendWindowSeconds: 900,
+  globalSendMaxRequests: 10,
+  globalVerifyWindowSeconds: 900,
+  globalVerifyMaxRequests: 30,
+  ipSendWindowSeconds: 900,
+  ipSendMaxRequests: 5,
+  ipVerifyWindowSeconds: 900,
+  ipVerifyMaxRequests: 10,
+};
+
+function buildRuntimeConfig(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const codeTtlSeconds = clampInt(source.code_ttl_seconds, DEFAULT_CONFIG.codeTtlSeconds, 30, 3600);
+  const resendCooldownSeconds = clampInt(
+    source.resend_cooldown_seconds,
+    DEFAULT_CONFIG.resendCooldownSeconds,
+    5,
+    3600,
+  );
+  const maxCodeAttempts = clampInt(source.max_code_attempts, DEFAULT_CONFIG.maxCodeAttempts, 1, 100);
+  const globalSendWindowSeconds = clampInt(
+    source.global_send_window_seconds,
+    DEFAULT_CONFIG.globalSendWindowSeconds,
+    10,
+    86400,
+  );
+  const globalSendMaxRequests = clampInt(
+    source.global_send_max_requests,
+    DEFAULT_CONFIG.globalSendMaxRequests,
+    1,
+    1000,
+  );
+  const globalVerifyWindowSeconds = clampInt(
+    source.global_verify_window_seconds,
+    DEFAULT_CONFIG.globalVerifyWindowSeconds,
+    10,
+    86400,
+  );
+  const globalVerifyMaxRequests = clampInt(
+    source.global_verify_max_requests,
+    DEFAULT_CONFIG.globalVerifyMaxRequests,
+    1,
+    5000,
+  );
+  const ipSendWindowSeconds = clampInt(
+    source.ip_send_window_seconds,
+    DEFAULT_CONFIG.ipSendWindowSeconds,
+    10,
+    86400,
+  );
+  const ipSendMaxRequests = clampInt(
+    source.ip_send_max_requests,
+    DEFAULT_CONFIG.ipSendMaxRequests,
+    1,
+    1000,
+  );
+  const ipVerifyWindowSeconds = clampInt(
+    source.ip_verify_window_seconds,
+    DEFAULT_CONFIG.ipVerifyWindowSeconds,
+    10,
+    86400,
+  );
+  const ipVerifyMaxRequests = clampInt(
+    source.ip_verify_max_requests,
+    DEFAULT_CONFIG.ipVerifyMaxRequests,
+    1,
+    5000,
+  );
+
+  return {
+    codeTtlSeconds: codeTtlSeconds,
+    codeTtlMs: codeTtlSeconds * 1000,
+    resendCooldownSeconds: resendCooldownSeconds,
+    resendCooldownMs: resendCooldownSeconds * 1000,
+    maxCodeAttempts: maxCodeAttempts,
+    globalSendWindowMs: globalSendWindowSeconds * 1000,
+    globalSendMaxRequests: globalSendMaxRequests,
+    globalVerifyWindowMs: globalVerifyWindowSeconds * 1000,
+    globalVerifyMaxRequests: globalVerifyMaxRequests,
+    ipSendWindowMs: ipSendWindowSeconds * 1000,
+    ipSendMaxRequests: ipSendMaxRequests,
+    ipVerifyWindowMs: ipVerifyWindowSeconds * 1000,
+    ipVerifyMaxRequests: ipVerifyMaxRequests,
+  };
+}
+
+function clampInt(value, fallback, min, max) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const integer = Math.floor(parsed);
+  if (integer < min) {
+    return min;
+  }
+  if (integer > max) {
+    return max;
+  }
+  return integer;
+}
+
+function createGlobalRateLimiter() {
+  let timestamps = [];
+
+  function prune(at, windowMs) {
+    const cutoff = at - windowMs;
+    if (timestamps.length === 0) {
+      return;
+    }
+    let firstValid = 0;
+    while (firstValid < timestamps.length && timestamps[firstValid] <= cutoff) {
+      firstValid += 1;
+    }
+    if (firstValid > 0) {
+      timestamps = timestamps.slice(firstValid);
+    }
+  }
+
+  return {
+    check: function (at, windowMs, maxRequests) {
+      prune(at, windowMs);
+      if (timestamps.length >= maxRequests) {
+        const retryAfterMs = Math.max(1000, timestamps[0] + windowMs - at);
+        return {
+          allowed: false,
+          retryAfter: Math.ceil(retryAfterMs / 1000),
+        };
+      }
+      return { allowed: true, retryAfter: 0 };
+    },
+    record: function (at, windowMs) {
+      prune(at, windowMs);
+      timestamps.push(at);
+    },
+    reset: function () {
+      timestamps = [];
+    },
+  };
+}
+
+function createIPRateLimiter() {
+  const buckets = new Map();
+
+  function normalizeKey(ip) {
+    return ip || "unknown";
+  }
+
+  function pruneBucket(timestamps, at, windowMs) {
+    const cutoff = at - windowMs;
+    let firstValid = 0;
+    while (firstValid < timestamps.length && timestamps[firstValid] <= cutoff) {
+      firstValid += 1;
+    }
+    if (firstValid === 0) {
+      return timestamps;
+    }
+    if (firstValid >= timestamps.length) {
+      return [];
+    }
+    return timestamps.slice(firstValid);
+  }
+
+  function evictIfFull(at, windowMs) {
+    if (buckets.size < MAX_TRACKED_IPS) {
+      return;
+    }
+    buckets.forEach(function (timestamps, key) {
+      const active = pruneBucket(timestamps, at, windowMs);
+      if (active.length === 0) {
+        buckets.delete(key);
+      } else if (active !== timestamps) {
+        buckets.set(key, active);
+      }
+    });
+    while (buckets.size >= MAX_TRACKED_IPS) {
+      const oldestKey = buckets.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      buckets.delete(oldestKey);
+    }
+  }
+
+  return {
+    check: function (ip, at, windowMs, maxRequests) {
+      const key = normalizeKey(ip);
+      const existing = buckets.get(key);
+      if (!existing) {
+        return { allowed: true, retryAfter: 0 };
+      }
+      const active = pruneBucket(existing, at, windowMs);
+      if (active.length === 0) {
+        buckets.delete(key);
+        return { allowed: true, retryAfter: 0 };
+      }
+      if (active !== existing) {
+        buckets.set(key, active);
+      }
+      if (active.length >= maxRequests) {
+        const retryAfterMs = Math.max(1000, active[0] + windowMs - at);
+        return {
+          allowed: false,
+          retryAfter: Math.ceil(retryAfterMs / 1000),
+        };
+      }
+      return { allowed: true, retryAfter: 0 };
+    },
+    record: function (ip, at, windowMs) {
+      const key = normalizeKey(ip);
+      const existing = buckets.get(key);
+      let active = existing ? pruneBucket(existing, at, windowMs) : [];
+      if (!existing) {
+        evictIfFull(at, windowMs);
+      } else {
+        // Refresh insertion order so active IPs are retained over stale ones on eviction.
+        buckets.delete(key);
+      }
+      active.push(at);
+      buckets.set(key, active);
+    },
+    reset: function () {
+      buckets.clear();
+    },
+  };
+}
+
+let config = buildRuntimeConfig(null);
+// Only a single active verification code may exist at any moment.
+let activeCode = null;
 let nextCodeSendAt = 0;
+let sendLockToken = null;
+let sendLockExpiresAt = 0;
+
+const globalSendLimiter = createGlobalRateLimiter();
+const ipSendLimiter = createIPRateLimiter();
+const globalVerifyLimiter = createGlobalRateLimiter();
+const ipVerifyLimiter = createIPRateLimiter();
 
 function now() {
   return new Date().toISOString();
@@ -20,6 +259,14 @@ function now() {
 
 function stringValue(value) {
   return typeof value === "string" ? value : "";
+}
+
+function formatDurationZh(seconds) {
+  const total = Math.max(1, Math.floor(Number(seconds) || 0));
+  if (total % 60 === 0) {
+    return String(total / 60) + " 分钟";
+  }
+  return String(total) + " 秒";
 }
 
 function jsonResponse(res, status, body) {
@@ -33,7 +280,46 @@ function failure(res, status, code) {
   jsonResponse(res, status, { ok: false, code: code });
 }
 
+function rateLimitFailure(res, code, retryAfter) {
+  const seconds = Math.max(1, Math.ceil(Number(retryAfter) || 1));
+  res.setHeader("Retry-After", String(seconds));
+  jsonResponse(res, 429, { ok: false, code: code, retry_after: seconds });
+}
+
+function headerValue(req, name) {
+  if (!req || !req.headers || typeof req.headers !== "object") {
+    return "";
+  }
+  return stringValue(req.headers[name]);
+}
+
+function isCrossSiteRequest(req) {
+  return headerValue(req, "sec-fetch-site").trim().toLowerCase() === "cross-site";
+}
+
+function hasJSONContentType(req) {
+  const mediaType = headerValue(req, "content-type").split(";")[0].trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
+function sanitizeUserAgent(req) {
+  const raw = stringValue(req.context && req.context.user_agent);
+  const cleaned = raw.replace(/[\x00-\x1f\x7f]+/g, " ").trim();
+  if (cleaned.length <= MAX_USER_AGENT_LENGTH) {
+    return cleaned;
+  }
+  return cleaned.slice(0, MAX_USER_AGENT_LENGTH);
+}
+
 function parseBody(req, res) {
+  if (isCrossSiteRequest(req)) {
+    failure(res, 403, "forbidden");
+    return null;
+  }
+  if (!hasJSONContentType(req)) {
+    failure(res, 415, "invalid_request");
+    return null;
+  }
   try {
     const value = JSON.parse(req.body || "{}");
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -76,62 +362,101 @@ function equalHash(left, right) {
   );
 }
 
+function equalText(left, right) {
+  const leftDigest = crypto.createHash("sha256").update(stringValue(left)).digest();
+  const rightDigest = crypto.createHash("sha256").update(stringValue(right)).digest();
+  return crypto.timingSafeEqual(leftDigest, rightDigest);
+}
+
 function clientIP(req) {
-  return stringValue(req.context && req.context.remote_ip);
+  return stringValue(req.context && req.context.remote_ip).trim();
 }
 
 function isExpired(record, at) {
   return !record || at >= record.expiresAt;
 }
 
-function currentRecord(ip, at) {
-  const record = loginCodesByIP.get(ip);
-  if (isExpired(record, at)) {
-    loginCodesByIP.delete(ip);
+function getActiveCode(at) {
+  if (isExpired(activeCode, at)) {
+    activeCode = null;
     return null;
   }
-  return record || null;
+  return activeCode;
 }
 
-function ipAttemptRecord(ip, at) {
-  const key = ip || "unknown";
-  const record = failedAttemptsByIP.get(key);
-  if (!record || at >= record.expiresAt) {
-    failedAttemptsByIP.delete(key);
+function consumeDualRateLimit(
+  ipLimiter,
+  globalLimiter,
+  ip,
+  at,
+  ipWindowMs,
+  ipMaxRequests,
+  globalWindowMs,
+  globalMaxRequests,
+) {
+  // Check both limiters before recording so an abusive IP hitting its per-IP
+  // ceiling cannot also exhaust the global quota for other clients.
+  const ipCheck = ipLimiter.check(ip, at, ipWindowMs, ipMaxRequests);
+  if (!ipCheck.allowed) {
+    return {
+      allowed: false,
+      code: "ip_rate_limited",
+      retryAfter: ipCheck.retryAfter,
+    };
+  }
+  const globalCheck = globalLimiter.check(at, globalWindowMs, globalMaxRequests);
+  if (!globalCheck.allowed) {
+    return {
+      allowed: false,
+      code: "global_rate_limited",
+      retryAfter: globalCheck.retryAfter,
+    };
+  }
+  ipLimiter.record(ip, at, ipWindowMs);
+  globalLimiter.record(at, globalWindowMs);
+  return { allowed: true, code: "", retryAfter: 0 };
+}
+
+function acquireSendLock(at) {
+  if (sendLockToken !== null && at < sendLockExpiresAt) {
     return null;
   }
-  return record;
+  const token = randomToken();
+  sendLockToken = token;
+  sendLockExpiresAt = at + SEND_LOCK_TTL_MS;
+  return token;
 }
 
-function isIPRateLimited(ip, at) {
-  const record = ipAttemptRecord(ip, at);
-  return record !== null && record.count >= MAX_IP_ATTEMPTS;
-}
-
-function registerIPFailure(ip, at) {
-  const key = ip || "unknown";
-  let record = ipAttemptRecord(key, at);
-  if (!record) {
-    record = { count: 0, expiresAt: at + IP_ATTEMPT_WINDOW_MS };
-    failedAttemptsByIP.set(key, record);
+function releaseSendLock(token) {
+  if (token !== null && sendLockToken === token) {
+    sendLockToken = null;
+    sendLockExpiresAt = 0;
   }
-  record.count += 1;
-  return record.count;
-}
-
-function clearIPFailures(ip) {
-  failedAttemptsByIP.delete(ip || "unknown");
 }
 
 function cookieSecure(req) {
-  const forwarded = stringValue(req.headers["x-forwarded-proto"])
+  const forwarded = headerValue(req, "x-forwarded-proto")
     .split(",")[0]
     .trim()
     .toLowerCase();
   if (forwarded) {
     return forwarded === "https";
   }
-  return stringValue(req.headers.origin).toLowerCase().startsWith("https://");
+  const forwardedProtocol = headerValue(req, "x-forwarded-protocol")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProtocol) {
+    return forwardedProtocol === "https";
+  }
+  if (headerValue(req, "x-forwarded-ssl").trim().toLowerCase() === "on") {
+    return true;
+  }
+  const urlScheme = headerValue(req, "x-url-scheme").trim().toLowerCase();
+  if (urlScheme) {
+    return urlScheme === "https";
+  }
+  return headerValue(req, "origin").trim().toLowerCase().startsWith("https://");
 }
 
 function sessionCookie(token, req) {
@@ -185,7 +510,7 @@ async function createSession(req, userUUID) {
     [
       userUUID,
       token,
-      stringValue(req.context && req.context.user_agent),
+      sanitizeUserAgent(req),
       clientIP(req),
       "one-time code",
       createdAt,
@@ -196,6 +521,38 @@ async function createSession(req, userUUID) {
     ],
   );
   return token;
+}
+
+async function ensureNotificationEnabled() {
+  const settings = await server.call("admin:getSettings");
+  if (!settings || settings.notification_enabled !== true) {
+    throw new Error("notification_disabled");
+  }
+  const method = stringValue(settings.notification_method).trim().toLowerCase();
+  if (!method || method === "none") {
+    throw new Error("notification_unconfigured");
+  }
+}
+
+async function dispatchCodeNotification(record, code) {
+  // Enforce at-most-once notification dispatch per generated code record.
+  if (!record || record.notificationSent) {
+    throw new Error("code_notification_already_sent");
+  }
+  record.notificationSent = true;
+  await server.call("admin:sendNotification", {
+    event: {
+      event: "Login",
+      time: now(),
+      emoji: "🔐",
+      message:
+        "Komari 一次性登录验证码：" +
+        code +
+        "\n有效期：" +
+        formatDurationZh(config.codeTtlSeconds) +
+        "。验证码由大写字母和数字组成。若非本人操作，请忽略此通知。",
+    },
+  });
 }
 
 function notifySuccessfulLogin(req, username) {
@@ -212,7 +569,7 @@ function notifySuccessfulLogin(req, username) {
           "\nIP：" +
           clientIP(req) +
           "\n设备：" +
-          stringValue(req.context && req.context.user_agent),
+          sanitizeUserAgent(req),
       },
     })
     .catch(function (error) {
@@ -223,120 +580,189 @@ function notifySuccessfulLogin(req, username) {
 async function sendCode(req, res) {
   const at = Date.now();
   const ip = clientIP(req);
+
+  const sendRateLimit = consumeDualRateLimit(
+    ipSendLimiter,
+    globalSendLimiter,
+    ip,
+    at,
+    config.ipSendWindowMs,
+    config.ipSendMaxRequests,
+    config.globalSendWindowMs,
+    config.globalSendMaxRequests,
+  );
+  if (!sendRateLimit.allowed) {
+    rateLimitFailure(res, sendRateLimit.code, sendRateLimit.retryAfter);
+    return;
+  }
+
   const body = parseBody(req, res);
   if (!body) {
     return;
   }
   const username = stringValue(body.username).trim();
-  let user;
-  try {
-    user = await onlyUser();
-  } catch (error) {
-    console.error("[komari-otp-login] failed to read user:", error);
-    failure(res, 500, "login_failed");
-    return;
-  }
-  if (!username || username !== user.username) {
+  if (!username) {
     failure(res, 401, "invalid_username");
     return;
   }
 
-  if (at < nextCodeSendAt) {
-    failure(res, 429, "resend_too_soon");
+  const lockToken = acquireSendLock(at);
+  if (lockToken === null) {
+    rateLimitFailure(res, "send_in_progress", 1);
     return;
   }
-
-  const existing = currentRecord(ip, at);
-  if (existing && at < existing.resendAt) {
-    failure(res, 429, "resend_too_soon");
-    return;
-  }
-
-  const code = randomCode();
-  const salt = randomToken();
-  const record = {
-    hash: codeHash(code, salt),
-    salt: salt,
-    expiresAt: at + CODE_TTL_MS,
-    resendAt: at + RESEND_COOLDOWN_MS,
-    attempts: 0,
-    username: user.username,
-    userUUID: user.uuid,
-  };
 
   try {
-    await server.call("admin:sendNotification", {
-      event: {
-        event: "Login",
-        time: now(),
-        emoji: "🔐",
-        message:
-          "Komari 一次性登录验证码：" +
-          code +
-          "\n有效期：3 分钟。验证码由大写字母和数字组成。若非本人操作，请忽略此通知。",
-      },
-    });
-  } catch (error) {
-    console.error("[komari-otp-login] failed to send code:", error);
-    failure(res, 502, "notification_failed");
-    return;
-  }
+    if (at < nextCodeSendAt) {
+      rateLimitFailure(
+        res,
+        "resend_too_soon",
+        Math.max(1, Math.ceil((nextCodeSendAt - at) / 1000)),
+      );
+      return;
+    }
 
-  // A successful resend replaces and invalidates every prior active code.
-  loginCodesByIP.clear();
-  loginCodesByIP.set(ip, record);
-  nextCodeSendAt = at + RESEND_COOLDOWN_MS;
-  jsonResponse(res, 200, {
-    ok: true,
-    expires_in: Math.floor(CODE_TTL_MS / 1000),
-    resend_in: Math.floor(RESEND_COOLDOWN_MS / 1000),
-  });
+    let user;
+    try {
+      user = await onlyUser();
+    } catch (error) {
+      console.error("[komari-otp-login] failed to read user:", error);
+      if (!res.isAborted()) {
+        failure(res, 500, "login_failed");
+      }
+      return;
+    }
+
+    if (!equalText(username, user.username)) {
+      if (!res.isAborted()) {
+        failure(res, 401, "invalid_username");
+      }
+      return;
+    }
+
+    try {
+      await ensureNotificationEnabled();
+    } catch (error) {
+      console.error("[komari-otp-login] notification channel unavailable:", error);
+      if (!res.isAborted()) {
+        failure(res, 502, "notification_failed");
+      }
+      return;
+    }
+
+    const issuedAt = Date.now();
+    if (issuedAt < nextCodeSendAt) {
+      if (!res.isAborted()) {
+        rateLimitFailure(
+          res,
+          "resend_too_soon",
+          Math.max(1, Math.ceil((nextCodeSendAt - issuedAt) / 1000)),
+        );
+      }
+      return;
+    }
+
+    const code = randomCode();
+    const salt = randomToken();
+    const record = {
+      id: randomToken(),
+      ip: ip,
+      hash: codeHash(code, salt),
+      salt: salt,
+      createdAt: issuedAt,
+      expiresAt: issuedAt + config.codeTtlMs,
+      attempts: 0,
+      username: user.username,
+      userUUID: user.uuid,
+      notificationSent: false,
+    };
+
+    // Issuing a new code immediately replaces and invalidates any prior active code.
+    activeCode = record;
+
+    try {
+      await dispatchCodeNotification(record, code);
+    } catch (error) {
+      console.error("[komari-otp-login] failed to send code:", error);
+      if (activeCode === record) {
+        activeCode = null;
+      }
+      if (!res.isAborted()) {
+        failure(res, 502, "notification_failed");
+      }
+      return;
+    }
+
+    const sentAt = Date.now();
+    if (activeCode === record) {
+      record.expiresAt = sentAt + config.codeTtlMs;
+    }
+    if (sendLockToken === lockToken) {
+      nextCodeSendAt = sentAt + config.resendCooldownMs;
+    }
+
+    if (!res.isAborted()) {
+      jsonResponse(res, 200, {
+        ok: true,
+        expires_in: config.codeTtlSeconds,
+        resend_in: config.resendCooldownSeconds,
+      });
+    }
+  } finally {
+    releaseSendLock(lockToken);
+  }
 }
 
 async function verifyCode(req, res) {
+  const at = Date.now();
+  const ip = clientIP(req);
+
+  const verifyRateLimit = consumeDualRateLimit(
+    ipVerifyLimiter,
+    globalVerifyLimiter,
+    ip,
+    at,
+    config.ipVerifyWindowMs,
+    config.ipVerifyMaxRequests,
+    config.globalVerifyWindowMs,
+    config.globalVerifyMaxRequests,
+  );
+  if (!verifyRateLimit.allowed) {
+    rateLimitFailure(res, verifyRateLimit.code, verifyRateLimit.retryAfter);
+    return;
+  }
+
   const body = parseBody(req, res);
   if (!body) {
     return;
   }
-  const at = Date.now();
-  const ip = clientIP(req);
-  const record = currentRecord(ip, at);
-  if (!record) {
+
+  const record = getActiveCode(at);
+  if (!record || record.ip !== ip) {
     failure(res, 400, "code_expired");
-    return;
-  }
-  if (isIPRateLimited(ip, at)) {
-    failure(res, 429, "ip_rate_limited");
     return;
   }
 
   const username = stringValue(body.username).trim();
   const code = stringValue(body.code).trim().toUpperCase();
   if (!username || !/^[A-Z0-9]{8}$/.test(code)) {
-    registerIPFailure(ip, at);
     failure(res, 400, "invalid_code");
     return;
   }
 
-  if (record.username !== username) {
-    registerIPFailure(ip, at);
+  if (!equalText(record.username, username)) {
     failure(res, 400, "code_expired");
     return;
   }
-  if (record.attempts >= MAX_CODE_ATTEMPTS) {
-    loginCodesByIP.delete(ip);
+  if (record.attempts >= config.maxCodeAttempts) {
+    activeCode = null;
     failure(res, 429, "too_many_attempts");
     return;
   }
   if (!equalHash(record.hash, codeHash(code, record.salt))) {
     record.attempts += 1;
-    const ipAttempts = registerIPFailure(ip, at);
-    if (ipAttempts >= MAX_IP_ATTEMPTS) {
-      failure(res, 429, "ip_rate_limited");
-      return;
-    }
-    if (record.attempts >= MAX_CODE_ATTEMPTS) {
-      loginCodesByIP.delete(ip);
+    if (record.attempts >= config.maxCodeAttempts) {
+      activeCode = null;
       failure(res, 429, "too_many_attempts");
       return;
     }
@@ -344,16 +770,20 @@ async function verifyCode(req, res) {
     return;
   }
 
-  loginCodesByIP.delete(ip);
-  clearIPFailures(ip);
+  // Consume the one-time code synchronously before awaiting session creation.
+  activeCode = null;
   try {
     const token = await createSession(req, record.userUUID);
     res.setHeader("Set-Cookie", sessionCookie(token, req));
     notifySuccessfulLogin(req, record.username);
-    jsonResponse(res, 200, { ok: true, logged_in: true });
+    if (!res.isAborted()) {
+      jsonResponse(res, 200, { ok: true, logged_in: true });
+    }
   } catch (error) {
     console.error("[komari-otp-login] failed to create session:", error);
-    failure(res, 500, "login_failed");
+    if (!res.isAborted()) {
+      failure(res, 500, "login_failed");
+    }
   }
 }
 
@@ -368,7 +798,22 @@ function route(handler) {
   };
 }
 
-function load() {
+async function loadConfig() {
+  if (typeof server.getConfig !== "function") {
+    config = buildRuntimeConfig(null);
+    return;
+  }
+  try {
+    const raw = await server.getConfig();
+    config = buildRuntimeConfig(raw);
+  } catch (error) {
+    console.error("[komari-otp-login] failed to load configuration, using defaults:", error);
+    config = buildRuntimeConfig(null);
+  }
+}
+
+async function load() {
+  await loadConfig();
   server.route("POST", "/api/komari-otp-login/send", route(sendCode));
   server.route("POST", "/api/komari-otp-login/verify", route(verifyCode));
   server.injectHTML(
@@ -380,4 +825,15 @@ function load() {
       "</script>",
   );
   console.log("[komari-otp-login] loaded");
+}
+
+function unload() {
+  activeCode = null;
+  nextCodeSendAt = 0;
+  sendLockToken = null;
+  sendLockExpiresAt = 0;
+  globalSendLimiter.reset();
+  ipSendLimiter.reset();
+  globalVerifyLimiter.reset();
+  ipVerifyLimiter.reset();
 }
